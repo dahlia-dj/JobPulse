@@ -1,0 +1,155 @@
+x-airflow-common: &airflow-common
+  build:
+    context: ./airflow
+    dockerfile: Dockerfile
+  environment: &airflow-common-env
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_AIRFLOW_DB}
+    AIRFLOW__CORE__FERNET_KEY: ${AIRFLOW__CORE__FERNET_KEY}
+    AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+    AIRFLOW__CORE__DEFAULT_TIMEZONE: "Europe/Paris"
+    AIRFLOW__WEBSERVER__EXPOSE_CONFIG: "true"
+    # Variables applicatives lues par les DAGs / plugins (extraction, MinIO, DWH)
+    MINIO_ENDPOINT: ${MINIO_ENDPOINT}
+    MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+    MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+    MINIO_BUCKET_BRONZE: ${MINIO_BUCKET_BRONZE}
+    MINIO_BUCKET_SILVER: ${MINIO_BUCKET_SILVER}
+    POSTGRES_DWH_HOST: postgres
+    POSTGRES_DWH_PORT: 5432
+    POSTGRES_DWH_DB: ${POSTGRES_DWH_DB}
+    POSTGRES_DWH_USER: ${POSTGRES_USER}
+    POSTGRES_DWH_PASSWORD: ${POSTGRES_PASSWORD}
+    # Transmission des clés d'API aux conteneurs Airflow
+    FRANCE_TRAVAIL_CLIENT_ID: ${FRANCE_TRAVAIL_CLIENT_ID}
+    FRANCE_TRAVAIL_CLIENT_SECRET: ${FRANCE_TRAVAIL_CLIENT_SECRET}
+    FRANCE_TRAVAIL_SCOPE: ${FRANCE_TRAVAIL_SCOPE}
+    ADZUNA_APP_ID: ${ADZUNA_APP_ID}
+    ADZUNA_APP_KEY: ${ADZUNA_APP_KEY}
+    ADZUNA_COUNTRY: ${ADZUNA_COUNTRY}
+  volumes:
+    - ./airflow/dags:/opt/airflow/dags
+    - ./airflow/plugins:/opt/airflow/plugins
+    - ./airflow/logs:/opt/airflow/logs
+  user: "${AIRFLOW_UID:-50000}:0"
+  depends_on:
+    postgres:
+      condition: service_healthy
+    minio:
+      condition: service_healthy
+  networks:
+    - jobpulse-net
+
+services:
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: pfe_postgres
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_AIRFLOW_DB}
+      POSTGRES_DWH_DB: ${POSTGRES_DWH_DB}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./postgres/init:/docker-entrypoint-initdb.d
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_AIRFLOW_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+    networks:
+    - jobpulse-net
+
+  minio:
+    image: minio/minio:latest
+    container_name: pfe_minio
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+    volumes:
+      - minio_data:/data
+    ports:
+      - "9000:9000"   # API S3
+      - "9001:9001"   # Console web
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+    networks:
+    - jobpulse-net
+
+  minio-init:
+    image: minio/mc:latest
+    container_name: pfe_minio_init
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "
+      mc alias set local http://minio:9000 ${MINIO_ROOT_USER} ${MINIO_ROOT_PASSWORD} &&
+      mc mb --ignore-existing local/${MINIO_BUCKET_BRONZE} &&
+      mc mb --ignore-existing local/${MINIO_BUCKET_SILVER} &&
+      echo 'Buckets MinIO créés avec succès.'
+      "
+    networks:
+    - jobpulse-net
+
+  airflow-init:
+    <<: *airflow-common
+    container_name: pfe_airflow_init
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - >
+        airflow db migrate &&
+        airflow users create
+        --username ${AIRFLOW_ADMIN_USER}
+        --password ${AIRFLOW_ADMIN_PASSWORD}
+        --firstname ${AIRFLOW_ADMIN_FIRSTNAME}
+        --lastname ${AIRFLOW_ADMIN_LASTNAME}
+        --role Admin
+        --email ${AIRFLOW_ADMIN_EMAIL} || true
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  airflow-webserver:
+    <<: *airflow-common
+    container_name: pfe_airflow_webserver
+    command: webserver
+    ports:
+      - "8080:8080"
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8080/health"]
+      interval: 10s
+      timeout: 10s
+      retries: 10
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  airflow-scheduler:
+    <<: *airflow-common
+    container_name: pfe_airflow_scheduler
+    command: scheduler
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+volumes:
+  postgres_data:
+  minio_data:
+
+
+networks:
+  jobpulse-net:
+    driver: bridge  

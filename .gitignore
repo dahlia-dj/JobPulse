@@ -1,0 +1,23 @@
+# Secrets
+.env
+
+# Airflow
+airflow/logs/*
+!airflow/logs/.gitkeep
+airflow/plugins/**/__pycache__/
+airflow/dags/**/__pycache__/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Docker / volumes locaux
+postgres_data/
+minio_data/
+
+# OS / éditeurs
+.DS_Store
+.vscode/
+.idea/
