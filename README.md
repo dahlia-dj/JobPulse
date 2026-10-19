@@ -65,7 +65,7 @@ docker compose exec postgres psql -U $POSTGRES_USER -d job_offers_dwh -c "\dt go
 ## 5. Lancer la collecte
 
 Dans l'interface Airflow (http://localhost:8080), activer puis déclencher
-manuellement le DAG **`collect_job_offers`** (icône ▶). Il exécute en
+manuellement le DAG **`collect_job_offers`**. Il exécute en
 parallèle l'extraction France Travail et Adzuna, valide que des données ont
 bien été reçues, puis les écrit dans MinIO sous :
 
