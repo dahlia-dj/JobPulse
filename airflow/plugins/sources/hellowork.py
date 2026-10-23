@@ -23,6 +23,13 @@ site en conditions réelles (Playwright en mode non-headless) :
     pages détail sont rendues côté serveur (SEO oblige) : un simple
     requests.get suffit, pas besoin de Playwright pour celles-ci.
 
+  - Doublons : HelloWork remet des offres sponsorisées d'une page de liste à
+    l'autre (~10 % des liens sur un run de 1000). Les liens sont dédupliqués.
+  - Offres expirées : une page détail sans bloc JobPosting n'est pas une
+    offre exploitable ; elle est ignorée (pas écrite en Bronze avec des
+    "N/A"). Garde-fou : si plus de la moitié des pages visitées sont
+    ignorées, on lève une erreur (changement de balisage probable).
+
 ⚠️ Ces sélecteurs peuvent changer si HelloWork fait évoluer son site. À
 re-vérifier si le connecteur cesse de renvoyer des résultats.
 
@@ -39,6 +46,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import time
 
@@ -52,6 +60,11 @@ logger = logging.getLogger(__name__)
 SEARCH_URL = "https://www.hellowork.com/fr-fr/emploi/recherche.html"
 MAX_PAGES = 50  # garde-fou, au-delà des références observées
 DETAIL_TIMEOUT_SECONDS = 20
+# On collecte un peu plus de liens que max_offers pour compenser les offres
+# expirées qui seront ignorées ; max_offers reste le nombre d'offres valides
+# renvoyées.
+LINK_OVERFETCH_RATIO = 1.2
+MAX_SKIPPED_RATIO = 0.5
 
 # `or` plutôt que le seul défaut de .get() : docker-compose crée quand même
 # la variable d'environnement (vide) si elle est absente du .env, donc
@@ -118,11 +131,11 @@ def _clean_html_text(raw: str | None) -> str:
     return BeautifulSoup(raw, "html.parser").get_text(separator=" ", strip=True)
 
 
-def _fetch_offer_details(link: str) -> dict:
+def _fetch_offer_details(link: str) -> dict | None:
     """Récupère title/company/description/lieu/contrat/date/salaire depuis
-    le JSON-LD JobPosting de la page détail. Best-effort : toute erreur
-    (réseau, parsing, bloc absent) renvoie des champs à "N/A"/vides plutôt
-    que de faire échouer toute la collecte pour une seule offre."""
+    le JSON-LD JobPosting de la page détail. Renvoie None si la page n'est
+    pas une offre exploitable (expirée/supprimée, ou erreur réseau) :
+    l'appelant l'ignore."""
     details = {
         "title": "N/A",
         "company": "N/A",
@@ -142,14 +155,17 @@ def _fetch_offer_details(link: str) -> dict:
         response.raise_for_status()
     except requests.RequestException as exc:
         logger.warning("HelloWork : échec requête page détail %s (%s)", link, exc)
-        return details
+        return None
 
     soup = BeautifulSoup(response.text, "lxml")
     job_posting = _extract_job_posting_jsonld(soup)
 
     if not job_posting:
-        logger.warning("HelloWork : pas de bloc JSON-LD JobPosting trouvé sur %s", link)
-        return details
+        logger.warning(
+            "HelloWork : offre ignorée, pas de bloc JSON-LD JobPosting (offre expirée ou supprimée probable) : %s",
+            link,
+        )
+        return None
 
     details["title"] = job_posting.get("title") or "N/A"
     details["description"] = _clean_html_text(job_posting.get("description"))
@@ -183,7 +199,8 @@ def collect(max_offers: int | None = 1500, keyword: str = "data", location: str 
     enrichit chaque offre via le JSON-LD de sa page détail.
 
     Args:
-        max_offers: nombre maximum d'offres à récupérer.
+        max_offers: nombre maximum d'offres valides à renvoyer (les offres
+            expirées, ignorées, ne comptent pas).
         keyword: mot-clé de recherche (filtrage fait ici, à la Collecte).
         location: localisation transmise au paramètre "l" de l'URL.
 
@@ -191,10 +208,16 @@ def collect(max_offers: int | None = 1500, keyword: str = "data", location: str 
         Liste brute de dicts {title, company, description, location,
         contract_type, date_posted, salary, link} -- pas de transformation
         métier ici, c'est le rôle de la couche Silver en aval.
+
+    Raises:
+        RuntimeError: si plus de la moitié des pages visitées sont ignorées
+            (balisage du site probablement modifié).
     """
+    link_limit = math.ceil(max_offers * LINK_OVERFETCH_RATIO) if max_offers else None
     search_keyword = keyword.replace(" ", "+")
     url = f"{SEARCH_URL}?k={search_keyword}&l={location}"
     all_links: list[str] = []
+    seen_links: set[str] = set()
 
     with sync_playwright() as playwright:
         browser = playwright.chromium.launch(
@@ -224,10 +247,13 @@ def collect(max_offers: int | None = 1500, keyword: str = "data", location: str 
                         continue
                     if not link.startswith("https://www.hellowork.com"):
                         link = "https://www.hellowork.com" + link
+                    if link in seen_links:  # offres sponsorisées répétées entre pages
+                        continue
+                    seen_links.add(link)
                     all_links.append(link)
 
-                if max_offers and len(all_links) >= max_offers:
-                    all_links = all_links[:max_offers]
+                if link_limit and len(all_links) >= link_limit:
+                    all_links = all_links[:link_limit]
                     break
 
                 # Bouton "suivant" : <button name="p" value="{page_number + 1}">
@@ -261,13 +287,32 @@ def collect(max_offers: int | None = 1500, keyword: str = "data", location: str 
     logger.info("HelloWork : %d liens collectés, récupération des détails (JSON-LD)...", len(all_links))
 
     all_offers: list[dict] = []
-    for index, link in enumerate(all_links, start=1):
+    skipped = 0
+    for link in all_links:
         details = _fetch_offer_details(link)
-        all_offers.append({**details, "link": link})
+        if details is None:
+            skipped += 1
+        else:
+            all_offers.append({**details, "link": link})
 
-        if index % 50 == 0:
-            logger.info("HelloWork : détails récupérés pour %d/%d offres", index, len(all_links))
+        processed = len(all_offers) + skipped
+        if processed % 50 == 0:
+            logger.info("HelloWork : %d pages détail visitées (%d offres, %d ignorées)", processed, len(all_offers), skipped)
+
+        if max_offers and len(all_offers) >= max_offers:
+            break
 
         time.sleep(SCRAPE_DELAY_SECONDS)  # respect du site, une requête à la fois
+
+    processed = len(all_offers) + skipped
+    logger.info(
+        "HelloWork : %d offres conservées, %d ignorées (expirées ou sans JobPosting) sur %d pages détail visitées.",
+        len(all_offers), skipped, processed,
+    )
+    if processed and skipped / processed > MAX_SKIPPED_RATIO:
+        raise RuntimeError(
+            f"HelloWork : {skipped}/{processed} pages sans JobPosting (> {MAX_SKIPPED_RATIO:.0%}) : "
+            "le balisage du site a probablement changé, collecte annulée."
+        )
 
     return all_offers

@@ -99,23 +99,33 @@
 
 
 
-
 """
 DAG : collecte quotidienne des offres d'emploi liées à la data, depuis 4
-sources (France Travail, Adzuna, HelloWork, Welcome to the Jungle), et
-chargement brut dans la couche Bronze (MinIO).
+sources (2 par API : France Travail, Adzuna ; 2 par scraping : HelloWork,
+Free-Work), et chargement brut dans la couche Bronze (MinIO).
 
 Schéma du DAG (un seul DAG, 4 branches parallèles indépendantes) :
 
     extract_france_travail  ─▶ validate ─▶ load_to_bronze
     extract_adzuna           ─▶ validate ─▶ load_to_bronze
     extract_hellowork        ─▶ validate ─▶ load_to_bronze
-    extract_wttj              ─▶ validate ─▶ load_to_bronze
+    extract_freework         ─▶ validate ─▶ load_to_bronze
 
 Chaque étape d'extraction pousse sa liste d'offres en XCom ; l'étape de
 validation vérifie juste qu'on a bien reçu des données exploitables avant
 d'écrire dans MinIO (aucune transformation métier ici, volontairement --
 c'est le rôle de la couche Silver en aval).
+
+Sources écartées (voir docs/data_dictionary.md) :
+  - Welcome to the Jungle : son robots.txt interdit explicitement le chemin
+    de recherche (`*/jobs?query=*`, `/*?`) à tous les robots ; le serveur
+    renvoie la page d'accueil au lieu des résultats. Le connecteur
+    sources/wttj.py est conservé dans le dépôt à titre de référence mais
+    n'est plus branché ici.
+  - APEC : protégée par DataDome (HTTP 403 dès le sitemap, même avec un
+    simple GET), donc inaccessible sans contournement de la protection.
+  - Indeed : HTTP 403 (Cloudflare) dès la page de liste, et son robots.txt
+    interdit les pages détail (/viewjob) et la pagination profonde.
 
 Pourquoi un seul DAG plutôt que deux (API vs scraping) : sous LocalExecutor,
 séparer en plusieurs fichiers DAG n'isole pas réellement les dépendances ou
@@ -148,7 +158,7 @@ JOB_KEYWORD = "data"
 
 @dag(
     dag_id="collect_job_offers",
-    description="Collecte quotidienne des offres d'emploi 'data' (4 sources) vers la couche Bronze (MinIO)",
+    description="Collecte quotidienne des offres d'emploi data vers la couche Bronze (MinIO)",
     schedule="0 6 * * *",  # tous les jours à 06h00
     start_date=datetime(2026, 9, 1),
     catchup=False,
@@ -179,16 +189,16 @@ def collect_job_offers():
     def extract_hellowork() -> list[dict]:
         from sources import hellowork
 
-        offers = hellowork.collect(max_offers=1000, keyword=JOB_KEYWORD)
+        offers = hellowork.collect(max_offers=500, keyword=JOB_KEYWORD)
         logger.info("HelloWork : %d offres extraites (mot-clé: %s).", len(offers), JOB_KEYWORD)
         return offers
 
     @task
-    def extract_wttj() -> list[dict]:
-        from sources import wttj
+    def extract_freework() -> list[dict]:
+        from sources import freework
 
-        offers = wttj.collect(max_offers=1000, keyword=JOB_KEYWORD)
-        logger.info("Welcome to the Jungle : %d offres extraites (mot-clé: %s).", len(offers), JOB_KEYWORD)
+        offers = freework.collect(max_offers=500, keyword=JOB_KEYWORD)
+        logger.info("Free-Work : %d offres extraites (mot-clé: %s).", len(offers), JOB_KEYWORD)
         return offers
 
     @task
@@ -223,11 +233,10 @@ def collect_job_offers():
     hellowork_validated = validate.override(task_id="validate_hellowork")("hellowork", hellowork_offers)
     load_to_bronze.override(task_id="load_hellowork_to_bronze")("hellowork", hellowork_validated)
 
-    # Welcome to the Jungle
-    wttj_offers = extract_wttj()
-    wttj_validated = validate.override(task_id="validate_wttj")("wttj", wttj_offers)
-    load_to_bronze.override(task_id="load_wttj_to_bronze")("wttj", wttj_validated)
+    # Free-Work
+    freework_offers = extract_freework()
+    freework_validated = validate.override(task_id="validate_freework")("freework", freework_offers)
+    load_to_bronze.override(task_id="load_freework_to_bronze")("freework", freework_validated)
 
 
 collect_job_offers()
-
