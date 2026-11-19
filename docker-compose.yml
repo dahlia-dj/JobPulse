@@ -313,6 +313,28 @@ services:
         condition: service_completed_successfully
     restart: unless-stopped
 
+  # Application web JobPulse (tableau de bord + « Mon Profil Matcher »).
+  # Lit uniquement l'entrepôt Gold (connexion en lecture seule).
+  streamlit:
+    build:
+      context: ./streamlit
+    container_name: pfe_streamlit
+    environment:
+      POSTGRES_DWH_HOST: postgres
+      POSTGRES_DWH_PORT: 5432
+      POSTGRES_DWH_DB: ${POSTGRES_DWH_DB}
+      POSTGRES_DWH_USER: ${POSTGRES_USER}
+      POSTGRES_DWH_PASSWORD: ${POSTGRES_PASSWORD}
+    volumes:
+      # catalogue de compétences de la couche Silver, réutilisé pour lire les CV (lecture seule)
+      - ./airflow/plugins/silver:/app/silver:ro
+    ports:
+      - "8501:8501"   # http://localhost:8501
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+
 volumes:
   postgres_data:
   minio_data:

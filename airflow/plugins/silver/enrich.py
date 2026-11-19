@@ -262,9 +262,20 @@ def extract_education_level(description: str | None) -> str:
 # --------------------------------------------------------------------------
 # 5. Famille de métier (d'après le titre)
 # --------------------------------------------------------------------------
+# Hors périmètre, en deux niveaux :
+#  - mots qui excluent toujours l'offre (métiers du data center, saisie, électricité...) ;
+#  - mots de contexte (BTP, chantier, « data collection »...) qui n'excluent l'offre
+#    que si le titre ne cite PAS un vrai métier data : « Data Analyst - BTP » reste
+#    une offre de Data Analyst, « Mapping Data Collection Driver » est exclue.
+_OUT_OF_SCOPE = re.compile(r"data cent(?:er|re)|data entry|saisie|frigoriste|electricite|electricien")
+_OUT_OF_SCOPE_CONTEXT = re.compile(r"data collection|genie civil|btp|chantier")
+_DATA_ROLE = re.compile(
+    r"data analy|data engineer|data scien|\banalyste\b|architect|ingenieur (?:data|donnees)"
+    r"|chefs?(?: fe| e)? de projets? data|product owner data|data product"
+)
+
 # L'ordre compte : la première règle qui correspond l'emporte.
 _FAMILY_RULES = [
-    ("HORS_PERIMETRE", r"data cent(?:er|re)|data entry|data collection|saisie|frigoriste|electricite|electricien|genie civil|btp|chantier"),
     ("DATA_SCIENTIST", r"data scien|scientifique des donnees|data science|statisticien"),
     ("ML_IA", r"machine learning|\bml\b|mlops|\bai engineer|\bia engineer|ingenieur (?:ia|ai)\b|deep learning|\bnlp\b|computer vision|\bllm|genai|ia generative|ingenieur intelligence artificielle|prompt engineer"),
     ("DATA_ARCHITECT", r"architect|data model(?:er|eur|euse|ler)"),
@@ -284,7 +295,29 @@ def classify_job_family(title: str | None) -> str:
     if not t:
         return "AUTRE"
     # norm_text enlève les caractères spéciaux ; on garde les mots pour les règles ci-dessus.
+    if _OUT_OF_SCOPE.search(t):
+        return "HORS_PERIMETRE"
+    if _OUT_OF_SCOPE_CONTEXT.search(t) and not _DATA_ROLE.search(t):
+        return "HORS_PERIMETRE"
     for name, rx in _FAMILY_RULES:
         if rx.search(t):
             return name
+    # Aucune famille data reconnue : on ne garde l'offre (famille AUTRE) que si son
+    # titre relève au moins du numérique. Sinon (vente, immobilier, délégué médical...),
+    # elle a été remontée par le seul mot « data » de sa description : hors périmètre.
+    if not _DIGITAL_DOMAIN.search(t):
+        return "HORS_PERIMETRE"
     return "AUTRE"
+
+
+# Mots du domaine numérique / data, cherchés dans le titre normalisé (sans accents).
+_DIGITAL_DOMAIN = re.compile(
+    r"\bdata\b|donnee|\bbi\b|\bia\b|\bai\b|\bml\b|analy|statisti|actuai|quant"
+    r"|\bsql\b|python|java|scala|spark|\bsas\b|\br\b|cloud|devops|\bsre\b|kubernetes|docker"
+    r"|developpeu|developer|developpement (?:logiciel|informatique|web|applicati)|logiciel|software"
+    r"|informati|\bit\b|\bsi\b|systemes? d information|numerique|digital|\btech\b|technolog"
+    r"|ingenieur|engineer|architect|cyber|securite (?:informatique|des si)|reseau|infrastructure"
+    r"|\berp\b|\bsap\b|\bcrm\b|salesforce|servicenow|web|\bapi\b|product|projet|\bpmo\b"
+    r"|consultant|reporting|etl|algorithm|intelligence|automatisation|automation|\brpa\b|machine|modelisa"
+    r"|sgbd|\boracle\b|base de donnees|\bdba\b|martech"
+)

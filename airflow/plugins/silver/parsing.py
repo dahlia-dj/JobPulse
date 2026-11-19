@@ -123,6 +123,57 @@ def norm_company(raw: str | None) -> str:
 
 
 # --------------------------------------------------------------------------
+# Entreprise : nettoyage du nom
+# --------------------------------------------------------------------------
+# Les sources renseignent parfois le DIFFUSEUR de l'annonce (job board, plateforme
+# freelance, site d'emploi) à la place de l'employeur. Ces noms, comparés sous leur
+# forme normalisée (norm_company), sont remplacés par une valeur vide
+# (« Non renseignée » dans la couche Gold).
+NOT_EMPLOYERS = {
+    # plateformes freelance / ESN de mise en relation
+    "collective work", "collective", "free work", "freework", "freelance com", "lehibou", "infreelancing",
+    "insitoo freelances", "odhcom freelancerepublik", "mon consultant independant",
+    # sites d'emploi, multidiffuseurs
+    "direct emploi", "directemploi", "talents handicap", "groupe talents handicap", "forums talents handicap",
+    "handicap job", "linkedin job wrapping", "jobposting", "jobgether", "hellowork group", "hellowork",
+    "efinancialcareers", "meteojob", "pmejob", "talentplug", "jobinlive", "xtramile", "beetween",
+    "aerocontact", "l industrie recrute", "le mercato de l emploi", "mercato de l emploi",
+    "lasecurecrute fr", "job staging", "jobistart", "capijobnew", "pay job",
+    "cabinet de recrutement de travailleurs handicapes",
+    # services publics de l'emploi / portails
+    "france travail", "pole emploi", "choisir le service public",
+    # valeurs qui ne sont pas des noms d'entreprise
+    "nc", "n a", "na", "non communique", "non renseigne", "non external", "recruteur confidentiel",
+    "confidentiel", "entreprise confidentielle", "stage", "chef", "commerce", "marketing", "it", "digital",
+    "fonction support", "systemes d information", "site supply chain", "drh sirh", "oui",
+}
+# Code interne collé devant le nom : « 3510 AIRBUS SAS », « 06D0 Carrier SAS »
+# (exactement 4 caractères : « 123 Pare-Brise » est un vrai nom et n'est pas touché).
+_COMPANY_CODE_PREFIX = re.compile(r"^(?:\d{4}|\d{2}[A-Z]\d)\s+(?=\S)")
+_COMPANY_LABEL_PREFIX = re.compile(r"^\s*(?:entreprise|societe|société|company)\s*:\s*", re.IGNORECASE)
+
+
+def clean_company(raw: str | None) -> str | None:
+    """Nom d'entreprise propre, ou None si la source ne donne pas l'employeur.
+
+    - espaces, tabulations et retours à la ligne superflus supprimés ;
+    - préfixes « Entreprise : » et codes internes (« 3510 AIRBUS SAS ») retirés ;
+    - « 1 » parasite collé en fin de nom (« Wavestone1 ») retiré ;
+    - diffuseurs (plateformes, sites d'emploi) et valeurs vides de sens -> None.
+    """
+    if raw is None:
+        return None
+    name = re.sub(r"\s+", " ", str(raw)).strip().strip('"').strip()
+    name = _COMPANY_LABEL_PREFIX.sub("", name)
+    name = _COMPANY_CODE_PREFIX.sub("", name)
+    name = re.sub(r"(?<=[a-z])1$", "", name).strip()
+    key = norm_company(name)
+    if len(key) < 2 or key in NOT_EMPLOYERS:
+        return None
+    return name
+
+
+# --------------------------------------------------------------------------
 # Lieu
 # --------------------------------------------------------------------------
 REGIONS = {

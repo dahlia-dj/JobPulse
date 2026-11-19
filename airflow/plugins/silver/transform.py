@@ -51,6 +51,7 @@ clean_description_udf = F.udf(P.clean_description, T.StringType())
 clean_title_udf = F.udf(P.clean_title, T.StringType())
 norm_title_udf = F.udf(P.norm_title, T.StringType())
 norm_company_udf = F.udf(P.norm_company, T.StringType())
+clean_company_udf = F.udf(P.clean_company, T.StringType())
 norm_text_udf = F.udf(P.norm_text, T.StringType())
 annualize_udf = F.udf(P.annualize, T.DoubleType())
 source_id_udf = F.udf(P.source_id_from_url, T.StringType())
@@ -236,6 +237,12 @@ def build_snapshot_rows(spark: SparkSession, bronze_root: str) -> tuple[DataFram
         df = df.unionByName(other)
 
     df = df.withColumn("description", clean_description_udf("description_raw")).drop("description_raw")
+    # Nom d'entreprise nettoyé ; vide quand la source donne le diffuseur au lieu de l'employeur.
+    # Le nom d'origine (company_publisher) reste utilisé pour repérer les doublons entre
+    # sources : une même mission publiée par Collective.work sur France Travail et Adzuna
+    # doit toujours être fusionnée, même si son entreprise devient « Non renseignée ».
+    df = (df.withColumn("company_publisher", F.col("company"))
+            .withColumn("company", clean_company_udf("company")))
     df = df.withColumn("has_description", F.length("description") >= 50)
     # Contrat déduit du titre / début de description quand la source ne le donne pas.
     inferred = infer_contract_udf("title_raw", "description")  # titre d'origine : « Stage - … » y est encore
@@ -246,7 +253,7 @@ def build_snapshot_rows(spark: SparkSession, bronze_root: str) -> tuple[DataFram
     df = df.filter(F.col("title").isNotNull() & F.col("source_id").isNotNull())
     report["rows_without_title_dropped"] = before - df.count()
     df = (df.withColumn("title_norm", norm_title_udf("title"))
-            .withColumn("company_norm", norm_company_udf("company"))
+            .withColumn("company_norm", norm_company_udf(F.coalesce("company", "company_publisher")))
             .withColumn("city_norm", norm_text_udf("city")))
     return df, report
 
@@ -282,7 +289,11 @@ def merge_across_sources(df: DataFrame) -> DataFrame:
     full = ordered.rowsBetween(Window.unboundedPreceding, Window.unboundedFollowing)
 
     df = (
-        df.withColumn("_n_sources", F.size(F.collect_set("source").over(group)))
+        # Les offres sans clé (entreprise inconnue) ne forment PAS un groupe : sans ce
+        # F.when, Spark les rangeait toutes dans une même partition « clé nulle » et n'en
+        # gardait qu'une seule.
+        df.withColumn("_n_sources", F.when(F.col("dedup_key").isNotNull(),
+                                           F.size(F.collect_set("source").over(group))).otherwise(F.lit(1)))
           .withColumn("sources", F.when(F.col("dedup_key").isNotNull(), F.array_sort(F.collect_set("source").over(group)))
                                    .otherwise(F.array("source")))
           .withColumn("urls", F.when(F.col("dedup_key").isNotNull(), F.array_sort(F.collect_set("url").over(group)))
@@ -294,7 +305,9 @@ def merge_across_sources(df: DataFrame) -> DataFrame:
     )
     # Valeurs manquantes complétées par les autres sources du groupe (salaire, contrat).
     for name in ("salary_min", "salary_max", "salary_period", "salary_estimated"):
-        df = df.withColumn(name, F.coalesce(F.col(name), F.first(name, ignorenulls=True).over(full)))
+        df = df.withColumn(name, F.when(F.col("dedup_key").isNotNull(),
+                                        F.coalesce(F.col(name), F.first(name, ignorenulls=True).over(full)))
+                                 .otherwise(F.col(name)))
     df = df.withColumn("contract_type", F.when(
         (F.col("contract_type") == "INCONNU") & F.col("dedup_key").isNotNull(),
         F.coalesce(F.first(F.when(F.col("contract_type") != "INCONNU", F.col("contract_type")), ignorenulls=True).over(full),

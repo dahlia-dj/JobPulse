@@ -1,0 +1,6 @@
+streamlit==1.39.0
+plotly==5.24.1
+pandas==2.2.3
+psycopg2-binary==2.9.9
+pypdf==5.1.0
+spacy==3.8.16

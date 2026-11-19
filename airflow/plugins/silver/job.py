@@ -100,8 +100,21 @@ def run() -> dict:
 
         spark = get_spark()
         df, report = build_silver(spark, str(bronze_dir))
+
+        # Périmètre temporel : seules les offres publiées depuis MIN_POSTED_DATE
+        # (par défaut 2026-01-01). Le Bronze n'est pas modifié (il reste immuable) :
+        # les anciennes offres déjà collectées sont simplement écartées ici.
+        from pyspark.sql import functions as F
+        min_date = os.environ.get("MIN_POSTED_DATE", "2026-01-01")
+        n_before = df.count()
+        # (une offre sans date de publication est conservée : on ne peut pas la juger)
+        df = df.filter(F.col("date_posted").isNull()
+                       | (F.col("date_posted") >= F.to_timestamp(F.lit(min_date))))
         df = df.cache()
         n_rows = df.count()
+        report["min_posted_date"] = min_date
+        report["excluded_before_min_date"] = n_before - n_rows
+        logger.info("%d offres publiées avant le %s écartées", n_before - n_rows, min_date)
         if n_rows == 0:
             raise RuntimeError("Silver vide : on n'écrase pas la sortie précédente")
 
